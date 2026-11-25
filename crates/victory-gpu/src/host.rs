@@ -1823,9 +1823,30 @@ fn flagged_pieces(flags: impl Iterator<Item = (usize, u32, bool)>) -> std::colle
     flags.filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+fn readback_runs<K>(
+    pieces: &[(K, usize, usize, u64)],
+    same_buffer: impl Fn(&K, &K) -> bool,
+) -> impl Iterator<Item = (&K, usize, usize, u64)> {
+    pieces.chunk_by(move |left, right| {
+        left.2 == right.1
+            && left.3.checked_add((left.2 - left.1) as u64) == Some(right.3)
+            && same_buffer(&left.0, &right.0)
+    }).map(|run| {
+        let (buffer, lo, _, at) = &run[0];
+        (buffer, *lo, run[run.len() - 1].2, *at)
+    })
+}
+
 #[cfg(test)]
 mod relay_tests {
     use super::{flagged_pieces, landable};
+
+    #[test]
+    fn readback_commands_join_only_contiguous_copies_in_the_same_buffer() {
+        let pieces = [(0, 3, 5, 0), (0, 5, 9, 2), (0, 11, 15, 6), (1, 15, 20, 10), (1, 20, 22, 19)];
+        let runs: Vec<_> = super::readback_runs(&pieces, PartialEq::eq).collect();
+        assert_eq!(runs, [(&0, 3, 9, 0), (&0, 11, 15, 6), (&1, 15, 20, 10), (&1, 20, 22, 19)]);
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3314,8 +3335,8 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for (shadow, lo, hi, at) in readback_runs(&pieces, std::sync::Arc::ptr_eq) {
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -3531,7 +3552,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    for (&i, lo, hi, at) in readback_runs(&pieces, PartialEq::eq) {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
