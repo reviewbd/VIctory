@@ -848,34 +848,25 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
+/// Where `a` and `b` first differ.
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    let from = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .position(|(x, y)| x != y)
-        .map_or(whole, |word| word * 8);
+    let from = a.as_chunks::<256>().0.iter()
+        .zip(b.as_chunks::<256>().0)
+        .take_while(|(x, y)| x == y)
+        .count() * 256;
     a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
 }
 
 /// Where `a` and `b` (of one length) last differ.
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
-        return Some(whole + i);
-    }
-    let word = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .rposition(|(x, y)| x != y)?
-        * 8;
-    a[word..word + 8]
-        .iter()
-        .zip(&b[word..word + 8])
+    let end = a.len().min(b.len());
+    let same = a[..end].as_rchunks::<256>().1.iter()
+        .zip(b[..end].as_rchunks::<256>().1)
+        .rev()
+        .take_while(|(x, y)| x == y)
+        .count() * 256;
+    a[..end - same].iter().zip(&b[..end - same])
         .rposition(|(x, y)| x != y)
-        .map(|i| word + i)
 }
 
 #[cfg(test)]
@@ -885,11 +876,11 @@ mod difference_tests {
     /// The word-wise searches agree with the byte-wise ones they replace.
     #[test]
     fn differences_are_found_as_byte_by_byte() {
-        let base: Vec<u8> = (0..61u32).map(|i| (i * 7 + 3) as u8).collect();
+        let base: Vec<u8> = (0..513u32).map(|i| (i * 7 + 3) as u8).collect();
         let same = base.clone();
         assert_eq!(first_difference(&base, &same), None);
         assert_eq!(last_difference(&base, &same), None);
-        for len in [0usize, 1, 7, 8, 9, 16, 23, 61] {
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, 513] {
             for at in 0..len {
                 for other in at..len {
                     let (a, mut b) = (&base[..len], base[..len].to_vec());
