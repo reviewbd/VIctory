@@ -125,7 +125,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p);
     }
     p.made.get()?.as_ref()
 }
@@ -159,8 +159,8 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+/// Waits for `p` while the current frame has budget left.
+fn wait(p: &Pending) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
@@ -169,8 +169,9 @@ fn wait(p: &Pending, frame: u64) {
     // taken by a thread waiting now).
     static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
     let shared = shared_budget();
-    let left = {
+    let (frame, left) = {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -178,7 +179,7 @@ fn wait(p: &Pending, frame: u64) {
         if shared {
             spent.1 += left;
         }
-        left
+        (frame, left)
     };
     if left.is_zero() {
         return;
