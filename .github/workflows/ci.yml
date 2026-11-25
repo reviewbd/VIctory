@@ -31,3 +31,29 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Launcher smoke test (Windows PowerShell)
+        shell: powershell
+        run: ./tests/test-play.ps1
+      - name: Launcher smoke test (PowerShell 7)
+        run: ./tests/test-play.ps1
+      - name: Build release runtime
+        run: cargo build --release --locked -p victory
+      - name: Prepare Windows test package
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "victory-nvidia"
+          New-Item -ItemType Directory "$stage/target/release", "$stage/scripts" | Out-Null
+          Copy-Item target/release/victory.exe "$stage/target/release/"
+          Copy-Item scripts/play.ps1 "$stage/scripts/"
+          Copy-Item README.md, LICENSE, victory.example.toml $stage
+          & "$stage/target/release/victory.exe" run --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (Get-FileHash "$stage/target/release/victory.exe" -Algorithm SHA256).Hash |
+            Set-Content "$stage/victory.exe.sha256" -Encoding ascii
+      - name: Upload Windows test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-nvidia-windows-x64
+          path: ${{ runner.temp }}/victory-nvidia/
+          if-no-files-found: error
+          retention-days: 14
