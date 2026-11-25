@@ -36,3 +36,4 @@ try {
     [IO.Directory]::Delete($root, $true)
 }
 Write-Output "Launcher smoke test passed"
+exit 0
