@@ -1,0 +1,4 @@
+[submodule "variants/nvidia"]
+	path = variants/nvidia
+	url = https://github.com/reviewbd/VIctory.git
+	branch = nvidia/pipeline-frame-budget

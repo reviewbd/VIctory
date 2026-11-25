@@ -21,10 +21,6 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
-    /// A sum of 16-bit floats in the low halves (`v_add_f16`), each addition rounded to 16
-    /// bits: not associative, so only the balanced tree over the lanes in their order is
-    /// followed (see [`buddies`]), which is how the compiler sums a wave.
-    AddH,
     MinU,
     MaxU,
     MinI,
@@ -34,16 +30,16 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
+    /// `v_add_f16`: on the low halves (see [`Sym::Half`]).
+    AddH,
 }
 
 impl Op {
     fn of(name: &str) -> Option<Op> {
         Some(match name {
-            // the low dword of a 64-bit sum (`v_add_co_ci_u32` carries into
-            // the high one) is the 32-bit sum of the low dwords
+            // The low dwords of a 64-bit sum (the carry is not followed).
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
-            "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -60,38 +56,20 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
             Op::MinF => k == 0x7F80_0000,
             Op::MaxF => k == 0xFF80_0000,
+            Op::AddH => k & 0x7FFF == 0,
         }
     }
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
-    }
-}
-
-/// Whether the lane sets `a` and `b` are the two halves of one aligned run of lanes: lanes
-/// 2k and 2k+1, then two such pairs side by side, and so on up to the two halves of the
-/// wave. Sums joined only that way form the balanced tree over the lanes in their order,
-/// whichever of the two a lane adds to the other (the addition is commutative).
-fn buddies(a: u64, b: u64) -> bool {
-    let n = a.count_ones();
-    if n != b.count_ones() || !n.is_power_of_two() || n == 64 {
-        return false;
-    }
-    let run = |s: u64| {
-        let first = s.trailing_zeros();
-        (first.is_multiple_of(n) && s >> first == (1u64 << n) - 1).then_some(first)
-    };
-    match (run(a), run(b)) {
-        (Some(x), Some(y)) => x.min(y) % (2 * n) == 0 && x.abs_diff(y) == n,
-        _ => false,
+        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
     }
 }
 
@@ -112,6 +90,18 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// A 16-bit operation's result: the low half is `op` over `lanes` of
+    /// the low halves of `mask ? src : ident`; the high half is that of
+    /// lane `hi`'s `mask ? src : ident` (16-bit results keep the
+    /// register's high half).
+    Half {
+        op: Op,
+        src: Value,
+        mask: Value,
+        ident: u32,
+        lanes: u64,
+        hi: u32,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -125,6 +115,9 @@ pub(crate) enum Shape {
     Active(Op, Value, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
+    /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
+    /// giving the high half.
+    Half(Op, Value, Value, u32, u32),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -242,8 +235,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             && op.identity(ident)
             && oa.is_none_or(|o| o == op)
             && ob.is_none_or(|o| o == op)
-            && (!op.counts() || la & lb == 0)
-            && (op != Op::AddH || buddies(la, lb)) =>
+            && (!op.counts() || la & lb == 0) =>
         {
             Sym::Red {
                 op: Some(op),
@@ -254,6 +246,69 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             }
         }
         _ => Sym::Unknown,
+    }
+}
+
+/// A lane of 16-bit `op` on the low halves of `a` and `b`, the high half
+/// kept from the destination's `old` value.
+fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
+    // A low half: the identity, or `op` over lanes of one masked source.
+    let low = |s: Sym| match s {
+        Sym::K(k) if op.identity(k) => Some(None),
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } if op.identity(ident) => Some(Some((src, mask, ident, lanes))),
+        Sym::Half {
+            op: o,
+            src,
+            mask,
+            ident,
+            lanes,
+            ..
+        } if o == op => Some(Some((src, mask, ident, lanes))),
+        _ => None,
+    };
+    let (src, mask, ident, hi) = match old {
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } if lanes.is_power_of_two() => (src, mask, ident, lanes.trailing_zeros()),
+        Sym::Half {
+            src,
+            mask,
+            ident,
+            hi,
+            ..
+        } => (src, mask, ident, hi),
+        _ => return Sym::Unknown,
+    };
+    let (Some(x), Some(y)) = (low(a), b.and_then(low)) else {
+        return Sym::Unknown;
+    };
+    let mut lanes = 0;
+    for (s, m, i, l) in [x, y].into_iter().flatten() {
+        if (s, m, i) != (src, mask, ident) || lanes & l != 0 {
+            return Sym::Unknown;
+        }
+        lanes |= l;
+    }
+    if lanes == 0 {
+        return Sym::Unknown;
+    }
+    Sym::Half {
+        op,
+        src,
+        mask,
+        ident,
+        lanes,
+        hi,
     }
 }
 
@@ -495,6 +550,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
+            ("v_add_f16", Some(a)) if v.opsel == 0 => {
+                let b = src(1).unwrap_or_default();
+                (0..wave as usize)
+                    .map(|l| half(Op::AddH, a[l], b.get(l).copied(), old[l]))
+                    .collect()
+            }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
@@ -560,6 +621,14 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::Half {
+            op,
+            src,
+            mask,
+            ident,
+            lanes,
+            hi,
+        } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
         _ => None,
     };
     for (v, s) in uni {
@@ -659,32 +728,6 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     }
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
-
-/// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
-/// those outside the saved EXEC (s[4:5]) with 0.
-#[cfg(test)]
-pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
-    0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
-    0xD501_0001,
-    0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
-    0x3802_02E9,
-    0xDE54_C101, // v_or_b32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
-    0x3802_02E9,
-    0x9360_1201, // v_or_b32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
-    0x3802_02E9,
-    0x0009_2401, // v_or_b32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
-    0x3802_02FA,
-    0xFF09_4001, // v_or_b32 v1, v1, v1 row_mirror bound_ctrl:1
-    0xD778_0002,
-    0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
-    0x3802_0302, // v_or_b32 v1, v2, v1
-    0xD760_0007,
-    0x0001_4101, // v_readlane_b32 s7, v1, 32
-    0x3802_0207, // v_or_b32 v1, s7, v1
-    0xD760_0007,
-    0x0001_0101, // v_readlane_b32 s7, v1, 0
-    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-];
 
 #[cfg(test)]
 mod tests {
@@ -908,67 +951,6 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
-    }
-
-    /// `WaveActiveSum` of 16-bit floats, as compiled in
-    /// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation` (0x19c on): the tree the
-    /// lowering reproduces. A tree in another order is not followed.
-    #[test]
-    fn a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree() {
-        let words = |first: [u32; 2], second: [u32; 2]| {
-            [
-                0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
-                0xD501_0001,
-                0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
-                first[0],
-                first[1],
-                second[0],
-                second[1],
-                0x6402_02E9,
-                0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
-                0x6402_02FA,
-                0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
-                0xD778_0002,
-                0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
-                0x6402_0302, // v_add_f16 v1, v2, v1
-                0xD760_0007,
-                0x0001_4101, // v_readlane_b32 s7, v1, 32
-                0x6402_0207, // v_add_f16 v1, s7, v1
-                0xD760_0007,
-                0x0001_0101, // v_readlane_b32 s7, v1, 0
-                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-            ]
-        };
-        let pairs = [0x6402_02E9, 0xDE54_C101]; // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
-        let quads = [0x6402_02E9, 0x9360_1201]; // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
-        let shape = |w: &[u32]| {
-            let p = build(w, true);
-            let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(4)).unwrap();
-            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
-            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
-            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
-            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
-        };
-        let (found, want) = shape(&words(pairs, quads));
-        assert_eq!(found, Some(want));
-        // lanes two apart first, neighbours second: every lane counted once, but
-        // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
-        let (found, _) = shape(&words(quads, pairs));
-        assert_eq!(found, None);
-    }
-
-    #[test]
-    fn buddies_are_the_two_halves_of_an_aligned_run() {
-        assert!(buddies(0b01, 0b10));
-        assert!(buddies(0b1100, 0b0011));
-        assert!(buddies(0xF0, 0x0F));
-        assert!(buddies(u64::from(u32::MAX), u64::from(u32::MAX) << 32));
-        assert!(!buddies(0b010, 0b100)); // lanes 1 and 2: not one pair
-        assert!(!buddies(0b0011, 0b110000)); // pairs 0 and 2
-        assert!(!buddies(0b0101, 0b1010)); // not runs
-        assert!(!buddies(0b01, 0b1100)); // unequal
-        assert!(!buddies(0b11, 0b11));
     }
 
     #[test]

@@ -9,12 +9,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-pub(crate) const FENCE_IIDS: [Iid; 4] = [
+pub(crate) const FENCE_IIDS: [Iid; 5] = [
     guid(
         0x0a753dcf,
         0xc4d8,
         0x4b91,
         [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76],
+    ),
+    // ID3D12Fence1.
+    guid(
+        0x433685fe,
+        0xe22b,
+        0x4ca0,
+        [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
     ),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
@@ -75,7 +82,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-pub(crate) extern "system" fn completed(this: This) -> u64 {
+extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
@@ -88,19 +95,6 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // With submissions sent to the card and not waited for
-        // (`crate::host::late`) the signal may be behind them: they are
-        // settled, which sets it.
-        #[cfg(windows)]
-        if crate::host::late() {
-            drop(waiters);
-            crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
-                return S_OK;
-            }
-            tracing::warn!(value, "blocking fence wait not implemented");
-            return E_NOTIMPL;
-        }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");
@@ -109,8 +103,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
-/// Moves the fence to `value` and sets the events that waited for it.
-pub(crate) fn set(this: This, value: u64) {
+pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
@@ -121,12 +114,6 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
-}
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
-    set(this, value);
-    // A queue may have waited for it: what it held runs now.
-    #[cfg(windows)]
-    crate::queue::release_held(false);
     S_OK
 }
 
@@ -182,12 +169,45 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
-        // The title reads the value at the fence's address.
+        // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[test]
+    fn fence1_interface_is_created_and_queried() {
+        const FENCE1_IID: Iid = guid(
+            0x433685fe,
+            0xe22b,
+            0x4ca0,
+            [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
+        );
+        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Flags = extern "system" fn(This) -> u32;
+        type Release = extern "system" fn(This) -> u32;
+
+        // Direct creation as ID3D12Fence1, and GetCreationFlags at slot 0x58.
+        let mut f1 = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 3, 0x5, &FENCE1_IID, &mut f1), S_OK);
+        assert!(!f1.is_null());
+        assert_eq!(slot::<Flags>(f1, 0x58)(f1), 0x5);
+        assert_eq!(slot::<Release>(f1, 0x10)(f1), 0);
+
+        // QueryInterface from ID3D12Fence to ID3D12Fence1 returns the same object.
+        let mut f = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), 0, 0x2, &FENCE_IIDS[0], &mut f),
+            S_OK
+        );
+        let mut queried = std::ptr::null();
+        assert_eq!(slot::<Query>(f, 0x00)(f, &FENCE1_IID, &mut queried), S_OK);
+        assert_eq!(queried, f);
+        assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
+        assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
+        assert_eq!(slot::<Release>(f, 0x10)(f), 0);
     }
 }

@@ -1,7 +1,7 @@
 //! The console's DirectStorage (`XCRDAPI.dll`): a factory that opens files
 //! and creates request queues and status arrays the title polls. Its
 //! interfaces have grown since 2020 (new interface ids, new slots); the
-//! slots here are the ones the title calls, read from its call
+//! slots here are the ones Grand Theft Auto VI calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
 //! Submitted requests of every queue run on one pool of workers, as the
@@ -31,7 +31,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
-/// The factory interface the title asks for.
+/// The factory interface Grand Theft Auto VI asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
@@ -171,7 +171,7 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// name), plus a field Grand Theft Auto VI sets to 1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
@@ -216,7 +216,7 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -289,7 +289,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
         .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
-/// The title polls this (entry 0, a `Sleep(1)` loop) and never
+/// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
@@ -355,6 +355,8 @@ struct Lanes {
     refused: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
+    /// Requests into physical pages.
+    pages: u64,
     since: Option<std::time::Instant>,
 }
 
@@ -412,6 +414,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
+                    pages: 0,
                     since: None,
                 }),
                 work: Condvar::new(),
@@ -472,6 +475,9 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        if job.request.options & PAGE_DESTINATION != 0 {
+            self.pages += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -485,6 +491,7 @@ impl Lanes {
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -667,7 +674,7 @@ struct Request {
     source_size: u32,
     /// Compressed size between two decompression stages; unused here.
     intermediate_size: u32,
-    /// Matched by cancellation; the title leaves it 0.
+    /// Matched by cancellation; Grand Theft Auto VI leaves it 0.
     tag: u64,
     name: *const c_char,
 }
@@ -680,7 +687,7 @@ const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
-// The title's packages need neither, so requests with them fail.
+// Grand Theft Auto VI's packages need neither, so requests with them fail.
 
 const PAGE: usize = 64 * 1024;
 
@@ -778,7 +785,7 @@ extern "system" fn submit(this: QueueRef) {
 
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
-/// finished. The title calls this, not `Release`.
+/// finished. Grand Theft Auto VI calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
@@ -951,7 +958,7 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -974,24 +981,49 @@ fn into_destination(
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
+        return Ok(());
     }
+    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
+    // it is one the title has not filled yet. The title writes a request's
+    // page list after enqueueing it, and a queue half full is submitted on
+    // its own, so a read can start first. Read the list again for a few
+    // milliseconds before failing: the title never looks at a request's
+    // result, so a failed one is a model or texture left unwritten.
+    if pages.contains(&0) {
+        for _ in 0..LATE_LIST_TRIES {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // SAFETY: as above; the title's list, read again.
+            let again = unsafe {
+                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
+            };
+            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if late.is_power_of_two() {
+                    tracing::info!(
+                        late,
+                        "dstorage: a page list filled after its request started: written late"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        "dstorage: a destination's physical pages could not be written; its request fails"
+    );
+    Err(E_INVALIDARG)
 }
 
-/// Slots by the 2020 order, which the argument shapes at
-/// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
+/// Milliseconds a page list naming page 0 is read again for.
+const LATE_LIST_TRIES: u32 = 8;
+/// Page lists filled after their request started (written late).
+static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
+
+/// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
+/// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
@@ -1276,6 +1308,7 @@ mod tests {
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
+            pages: 0,
             since: None,
         }
     }
@@ -1492,6 +1525,52 @@ mod tests {
         assert_eq!(wait(array, 0), S_OK);
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
     #[test]

@@ -90,6 +90,14 @@ fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut Thi
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
 }
 
+fn enumeration_not_found(out: *mut This) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the caller supplies a writable output slot when non-null.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NOT_FOUND
+}
+
 /// The DXGI device also answers for the D3D12 device.
 extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if crate::device::is_device(iid) {
@@ -112,7 +120,7 @@ extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> H
 }
 extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
 }
@@ -165,7 +173,7 @@ extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) ->
 }
 extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
@@ -219,28 +227,7 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
-fn display_size() -> (u32, u32) {
-    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
-        size
-    })
-}
-
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
+/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
@@ -263,10 +250,9 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
-    let (width, height) = display_size();
     let mode = Mode {
-        width,
-        height,
+        width: 3840,
+        height: 2160,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -337,5 +323,19 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn out_of_range_enumeration_clears_output() {
+        for (object, offset, method) in [
+            (&FACTORY_OBJECT, 0x38, "EnumAdapters"),
+            (&FACTORY_OBJECT, 0x60, "EnumAdapters1"),
+            (&ADAPTER_OBJECT, 0x38, "EnumOutputs"),
+        ] {
+            let enumerate = slot::<Indexed>(object, offset);
+            let mut out = object as This;
+            assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
+            assert!(out.is_null(), "{method} left a stale output pointer");
+        }
     }
 }
