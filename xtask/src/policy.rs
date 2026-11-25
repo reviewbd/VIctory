@@ -19,6 +19,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
+    ".gitmodules",
     ".editorconfig",
     ".victory-root",
     "pre-commit",
@@ -57,7 +58,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
         }
         let content = if staged {
             let out = Command::new("git")
-                .args(["show", &format!(":{path}")])
+                .args(["cat-file", "blob", &format!(":{path}")])
                 .current_dir(root)
                 .output()?;
             if !out.status.success() {

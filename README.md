@@ -8,6 +8,28 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
+## Windows builds
+
+The root workspace builds the standard VIctory runtime. The NVIDIA variant
+uses the ztrx renderer and has its own pinned workspace, shader cache and
+launcher. Each Windows CI run publishes both builds. Download the artifact
+for your variant, extract it, then run the corresponding command:
+
+| Artifact | Command from the extracted directory |
+|---|---|
+| `victory-standard-windows-x64` | ` .\target\release\victory.exe run "D:\Games\Title\game.exe" --execute` |
+| `victory-nvidia-windows-x64` | `powershell -ExecutionPolicy Bypass -File .\scripts\play.ps1 -Game "D:\Games\Title\game.exe"` |
+
+To build the NVIDIA variant from source:
+
+```powershell
+git submodule update --init -- variants/nvidia
+Set-Location variants/nvidia
+cargo build --release --locked -p victory
+```
+
+See the NVIDIA workspace's README for its hardware requirements and rendering limitations.
+
 ## Status (2026-11-24)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps,
