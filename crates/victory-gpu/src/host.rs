@@ -1819,8 +1819,8 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
-    flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
+fn flagged_pieces(flags: impl Iterator<Item = (usize, u32, bool)>) -> std::collections::HashSet<(usize, u32)> {
+    flags.filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
 #[cfg(test)]
@@ -1855,7 +1855,7 @@ mod relay_tests {
         // Copy a: piece 3 under two ranges, flagged under the first only;
         // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
         let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
-        let fetch = flagged_pieces(&flags);
+        let fetch = flagged_pieces(flags.into_iter());
         assert!(fetch.contains(&(a, 3)));
         assert!(!fetch.contains(&(a, 4)));
         assert!(!fetch.contains(&(b, 3)));
@@ -2003,16 +2003,23 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
+    let before = ranges.len();
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
-    ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
-        }
+    if ranges.len() == before {
+        return;
     }
-    *ranges = out;
+    coalesce(ranges);
+}
+
+fn coalesce(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, prev| {
+        if next.0 > prev.1 {
+            return false;
+        }
+        prev.1 = prev.1.max(next.1);
+        true
+    });
 }
 
 /// Whether anything is in the air.
@@ -2405,14 +2412,11 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
-fn relay_hand_back(back: &[Declared]) {
+fn relay_hand_back(back: Vec<Declared>) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for (shadow, declared) in back {
-        if shadow.carded() {
-            continue;
-        }
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        join_ranges(&mut spans, declared.iter().copied());
+    for (shadow, mut spans) in back {
+        spans.retain(|&(from, to)| from < to);
+        coalesce(&mut spans);
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
@@ -3251,7 +3255,7 @@ impl Host {
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
             let mut seen = std::collections::HashSet::new();
             for plan in plans {
-                let flags: Vec<(usize, u32, bool)> = plan
+                let flags = plan
                     .ranges
                     .iter()
                     .flat_map(|r| {
@@ -3259,9 +3263,13 @@ impl Host {
                             let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
                         })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                    });
+                let fetched = flagged_pieces(flags);
+                if fetched.is_empty() {
+                    let count: u64 = plan.ranges.iter().map(|r| u64::from(r.span.pieces)).sum();
+                    crate::shadow::CARD_STATS[2].fetch_add(count, Ordering::Relaxed);
+                    continue;
+                }
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -3385,19 +3393,16 @@ impl Host {
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
+                        if shadow.carded() {
+                            continue;
+                        }
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
+                            Some((_, all)) => all.extend_from_slice(ranges),
                             None => back.push((shadow.clone(), ranges.clone())),
                         }
                     }
                 }
-                relay_hand_back(&back);
+                relay_hand_back(back);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {

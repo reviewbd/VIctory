@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$Game,
+    [switch]$Fast,
     [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
     [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
@@ -34,6 +35,10 @@ $settings = @{
     VICTORY_DUMP_TARGETS = $null
 }
 $saved = @{}
+if ($Fast) {
+    $settings.VICTORY_RELAY = '2'
+    $settings.VICTORY_LATE_WAIT = '3'
+}
 try {
     foreach ($key in $settings.Keys) {
         $saved[$key] = [Environment]::GetEnvironmentVariable($key)

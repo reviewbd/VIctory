@@ -47,6 +47,11 @@ Use `-Log <new file>` for a specific location. Existing logs are preserved.
 
 ## Faster settings (optional, off by default)
 
+Add `-Fast` to the launcher command to overlap GPU submissions and CPU
+readback using relay stage 2. To compare, replay the same scene after
+warming the shader cache, once with this switch and once without it.
+Read the FPS and ms/frame lines from the two logs.
+
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
 time on the test machines. Set them in PowerShell before running the script.
 
